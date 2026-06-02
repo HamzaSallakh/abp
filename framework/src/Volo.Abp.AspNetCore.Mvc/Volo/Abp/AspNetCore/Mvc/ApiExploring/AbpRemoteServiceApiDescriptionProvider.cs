@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Linq;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Abstractions;
@@ -16,6 +16,13 @@ public class AbpRemoteServiceApiDescriptionProvider : IApiDescriptionProvider, I
     private readonly IModelMetadataProvider _modelMetadataProvider;
     private readonly MvcOptions _mvcOptions;
     private readonly AbpRemoteServiceApiDescriptionProviderOptions _options;
+
+    // SupportedResponseTypes lives on a singleton options object, so the build below must run
+    // exactly once and single-threaded. Otherwise concurrent API-description rebuilds mutate the
+    // same ApiResponseFormats List<> at the same time and corrupt it ("Source array was not long
+    // enough"), and repeated rebuilds append duplicates without bound.
+    private static readonly object SyncLock = new object();
+    private static volatile bool _responseTypesInitialized;
 
     public AbpRemoteServiceApiDescriptionProvider(
         IModelMetadataProvider modelMetadataProvider,
@@ -59,29 +66,47 @@ public class AbpRemoteServiceApiDescriptionProvider : IApiDescriptionProvider, I
 
     protected virtual IEnumerable<ApiResponseType> GetApiResponseTypes()
     {
-        foreach (var apiResponse in _options.SupportedResponseTypes)
+        // Fast path: already built once. Return the shared (now read-only) collection.
+        if (_responseTypesInitialized)
         {
-            apiResponse.ModelMetadata = _modelMetadataProvider.GetMetadataForType(apiResponse.Type!);
-
-            foreach (var responseTypeMetadataProvider in _mvcOptions.OutputFormatters.OfType<IApiResponseTypeMetadataProvider>())
-            {
-                var formatterSupportedContentTypes = responseTypeMetadataProvider.GetSupportedContentTypes(null!, apiResponse.Type!);
-                if (formatterSupportedContentTypes == null)
-                {
-                    continue;
-                }
-
-                foreach (var formatterSupportedContentType in formatterSupportedContentTypes)
-                {
-                    apiResponse.ApiResponseFormats.Add(new ApiResponseFormat
-                    {
-                        Formatter = (IOutputFormatter)responseTypeMetadataProvider,
-                        MediaType = formatterSupportedContentType
-                    });
-                }
-            }
+            return _options.SupportedResponseTypes;
         }
 
-        return _options.SupportedResponseTypes;
+        lock (SyncLock)
+        {
+            if (_responseTypesInitialized)
+            {
+                return _options.SupportedResponseTypes;
+            }
+
+            foreach (var apiResponse in _options.SupportedResponseTypes)
+            {
+                apiResponse.ModelMetadata = _modelMetadataProvider.GetMetadataForType(apiResponse.Type!);
+
+                // Clear first so repeated builds don't accumulate duplicate formats on the shared list.
+                apiResponse.ApiResponseFormats.Clear();
+
+                foreach (var responseTypeMetadataProvider in _mvcOptions.OutputFormatters.OfType<IApiResponseTypeMetadataProvider>())
+                {
+                    var formatterSupportedContentTypes = responseTypeMetadataProvider.GetSupportedContentTypes(null!, apiResponse.Type!);
+                    if (formatterSupportedContentTypes == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var formatterSupportedContentType in formatterSupportedContentTypes)
+                    {
+                        apiResponse.ApiResponseFormats.Add(new ApiResponseFormat
+                        {
+                            Formatter = (IOutputFormatter)responseTypeMetadataProvider,
+                            MediaType = formatterSupportedContentType
+                        });
+                    }
+                }
+            }
+
+            _responseTypesInitialized = true;
+            return _options.SupportedResponseTypes;
+        }
     }
 }
